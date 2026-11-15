@@ -4,11 +4,17 @@ on:
   repository_dispatch:
     types: [clone_content]
   workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
+
+concurrency:
+  group: standby-worker-${{ github.run_number }}
+  cancel-in-progress: false
 
 jobs:
   clone_job:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
     steps:
       - name: Checkout Public Worker Code
         uses: actions/checkout@v4
@@ -35,20 +41,13 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Cloner Script
+      - name: Run Always-Ready Standby Worker Daemon
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           MONGO_URI: ${{ secrets.MONGO_URI }}
           DUMP_CHANNEL_ID: ${{ secrets.DUMP_CHANNEL_ID }}
-          USER_ID: ${{ github.event.client_payload.user_id }}
-          CHAT_ID: ${{ github.event.client_payload.chat_id }}
-          STATUS_MSG_ID: ${{ github.event.client_payload.status_msg_id }}
-          PEER_ID: ${{ github.event.client_payload.peer_id }}
-          MSG_IDS: ${{ github.event.client_payload.msg_ids }}
-          MAX_MB: ${{ github.event.client_payload.max_mb }}
-          WORKERS: ${{ github.event.client_payload.workers }}
-          SOURCE_LINK: ${{ github.event.client_payload.source_link }}
-          HELPER_BOT_ID: ${{ github.event.client_payload.helper_bot_id }}
+          WORKER_REPO_NAME: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: python cloner.py
