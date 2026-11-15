@@ -50,25 +50,26 @@ STATUS_MSG_ID = int(os.environ.get("STATUS_MSG_ID", "0"))
 PEER_ID = os.environ.get("PEER_ID", "")
 MSG_IDS_RAW = os.environ.get("MSG_IDS", "")
 MAX_MB = int(os.environ.get("MAX_MB", "500"))
-WORKERS = int(os.environ.get("WORKERS", "8"))
+WORKERS = int(os.environ.get("WORKERS", "16"))
 SOURCE_LINK = os.environ.get("SOURCE_LINK", "")
 HELPER_BOT_ID = int(os.environ.get("HELPER_BOT_ID", "0") or "0")
 
 PART_SIZE = 512 * 1024  # 512 KB
 
 # ==========================================
-# UI FORMATTING & NON-PREMIUM WAIT HANDLER
+# BLOCK PROGRESS BAR [███░░░░░░░] 30% & HELPERS
 # ==========================================
-def make_progress_bar(pct: float, length: int = 10) -> str:
+def make_block_bar(pct: float, length: int = 10) -> str:
     filled = min(length, max(0, int(round((pct / 100) * length))))
-    return "▰" * filled + "▱" * (length - filled)
+    bar = "█" * filled + "░" * (length - filled)
+    return f"[{bar}] {int(pct)}%"
 
 def format_eta(seconds: float) -> str:
     sec = max(1, int(seconds))
     if sec < 60:
-        return f"{sec} စက္ကန့်ခန့်"
+        return f"{sec}s"
     mins, rem_s = divmod(sec, 60)
-    return f"{mins} မိနစ် {rem_s} စက္ကန့်ခန့်"
+    return f"{mins}m {rem_s}s"
 
 def extract_wait_seconds(err: Exception) -> float:
     if hasattr(err, "seconds") and getattr(err, "seconds"):
@@ -102,7 +103,6 @@ async def resolve_dump_channel(client: TelegramClient):
         return await client.get_input_entity(PeerChannel(raw_id))
 
 async def send_chat_upload_action(bot_client: TelegramClient, is_video: bool, pct: int = 50):
-    """Telegram Chat ၏ အပေါ်ဆုံးအတန်းတွင် 'Sending video...' သို့မဟုတ် 'Sending file...' ပေါ်စေရန်"""
     try:
         action = SendMessageUploadVideoAction(progress=pct) if is_video else SendMessageUploadDocumentAction(progress=pct)
         await bot_client(SetTypingRequest(peer=CHAT_ID, action=action))
@@ -110,7 +110,7 @@ async def send_chat_upload_action(bot_client: TelegramClient, is_video: bool, pc
         pass
 
 # ==========================================
-# FAST PARALLEL MTPROTO SENDER POOL (0.8s Handshake)
+# FAST PARALLEL MTPROTO SENDER POOL
 # ==========================================
 class PersistentSenderPool:
     def __init__(self):
@@ -166,7 +166,6 @@ class PersistentSenderPool:
             await s.send(InvokeWithLayerRequest(LAYER, client._init_request))
             return s
 
-        # Connection အားလုံးကို တန်းစီမစောင့်ဘဲ တစ်ပြိုင်နက်တည်း (0.8s အတွင်း) ချိတ်ဆက်ခြင်း
         extra_senders = await asyncio.gather(*(connect_single() for _ in range(remaining)))
         senders.extend(extra_senders)
         return senders
@@ -182,13 +181,13 @@ class PersistentSenderPool:
                 pass
 
 # ==========================================
-# SMOOTH STREAMING ENGINE
+# ADAPTIVE PIPELINED TURBO STREAMING ENGINE
 # ==========================================
-async def fetch_single_part(dl_sender: MTProtoSender, location, part_idx: int, file_size: int):
+async def fetch_single_part(dl_sender: MTProtoSender, location, part_idx: int, file_size: int, throttled_flag: list):
     offset = part_idx * PART_SIZE
     expected_len = min(PART_SIZE, file_size - offset)
 
-    for attempt in range(15):
+    for attempt in range(16):
         try:
             buf = bytearray()
             curr_off = offset
@@ -204,12 +203,13 @@ async def fetch_single_part(dl_sender: MTProtoSender, location, part_idx: int, f
         except Exception as e:
             wait_sec = extract_wait_seconds(e)
             if wait_sec > 0:
-                jitter = random.uniform(0.4, 1.2)
+                throttled_flag[0] = True
+                jitter = random.uniform(0.3, 1.0)
                 await asyncio.sleep(wait_sec + jitter)
             else:
-                if attempt == 14:
+                if attempt == 15:
                     raise
-                await asyncio.sleep(1.0 + (attempt * 0.5))
+                await asyncio.sleep(0.8 + (attempt * 0.4))
 
 async def upload_single_part(
     ul_sender: MTProtoSender,
@@ -237,19 +237,25 @@ async def upload_single_part(
             else:
                 if attempt == 11:
                     raise
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.8)
 
-async def asymmetric_parallel_stream(
+async def adaptive_pipelined_stream(
     pool: PersistentSenderPool,
     user_client: TelegramClient,
     upload_client: TelegramClient,
     notify_bot: TelegramClient,
     document,
     file_name: str,
-    step_label: str,
+    step_counter: str,
     worker_count: int,
+    is_vip_mode: bool,
+    mode_badge: str,
     is_video: bool
 ):
+    """
+    VIP Mode တွင် 16x-24x Workers အပြည့်နှင့် Adaptive Pipelining (Batch 2x DL / 4x UL) သုံးပြီး
+    Standard Mode တွင် သတ်မှတ်ထားသော Free Workers (ဥပမာ 4x) ဖြင့် လုပ်ဆောင်ပေးသည့် အင်ဂျင်
+    """
     file_size = document.size
     total_parts = math.ceil(file_size / PART_SIZE)
     file_id = helpers.generate_random_long()
@@ -262,8 +268,17 @@ async def asymmetric_parallel_stream(
         thumb_size=""
     )
 
-    dl_worker_count = min(8, worker_count, total_parts)
-    ul_worker_count = min(worker_count, total_parts)
+    # VIP ဖြစ်ပါက 16x/24x Workers အပြည့်ဖွင့်ပေးပြီး Free ဖြစ်ပါက Standard Workers သာ သုံးမည်
+    if is_vip_mode:
+        dl_worker_count = min(worker_count, total_parts)
+        ul_worker_count = min(worker_count, total_parts)
+        dl_pipeline = 2
+        ul_pipeline = 4
+    else:
+        dl_worker_count = min(worker_count, 6, total_parts)
+        ul_worker_count = min(worker_count, 6, total_parts)
+        dl_pipeline = 1
+        ul_pipeline = 2
 
     dl_senders, ul_senders = await asyncio.gather(
         pool.get_dl_senders(user_client, document.dc_id, dl_worker_count),
@@ -274,61 +289,93 @@ async def asymmetric_parallel_stream(
     for part_idx in range(total_parts):
         part_queue.put_nowait(part_idx)
 
-    chunk_queue = asyncio.Queue(maxsize=ul_worker_count * 4)
+    chunk_queue = asyncio.Queue(maxsize=ul_worker_count * ul_pipeline * 2)
 
     uploaded_bytes = 0
     start_time = time.time()
     last_edit_time = [0.0]
+    throttled_flag = [False]  # Non-Premium Wait ထိပါက Pipeline အလိုအလျောက် ချိန်ညှိရန်
 
     async def dl_producer(idx: int, dl_sender: MTProtoSender):
-        await asyncio.sleep(idx * 0.12)
+        await asyncio.sleep(idx * 0.06)
         while not part_queue.empty():
-            try:
-                part_idx = part_queue.get_nowait()
-            except asyncio.QueueEmpty:
+            # Non-Premium Wait မထိသေးသရွေ့ VIP တွင် Pipelining (2x) ဖြင့် အမြန်ဆုံး ဆွဲမည်
+            curr_batch_size = 1 if throttled_flag[0] else dl_pipeline
+            batch_indices = []
+            for _ in range(curr_batch_size):
+                if part_queue.empty():
+                    break
+                try:
+                    batch_indices.append(part_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            if not batch_indices:
                 break
 
-            p_idx, c_data = await fetch_single_part(dl_sender, location, part_idx, file_size)
-            await chunk_queue.put((p_idx, c_data))
-            part_queue.task_done()
+            results = await asyncio.gather(*(
+                fetch_single_part(dl_sender, location, p_idx, file_size, throttled_flag)
+                for p_idx in batch_indices
+            ))
+
+            for p_idx, c_data in results:
+                await chunk_queue.put((p_idx, c_data))
+                part_queue.task_done()
+
+            # Free User ဖြစ်ပါက Standard Speed ဖြစ်စေရန် အနည်းငယ် Pacing ထိန်းမည်
+            if not is_vip_mode:
+                await asyncio.sleep(0.08)
 
     async def ul_consumer(ul_sender: MTProtoSender):
         nonlocal uploaded_bytes
         while True:
-            item = await chunk_queue.get()
-            if item is None:
+            first_item = await chunk_queue.get()
+            if first_item is None:
                 chunk_queue.task_done()
                 break
 
-            part_idx, chunk_data = item
-            sz = await upload_single_part(ul_sender, is_big, file_id, part_idx, total_parts, chunk_data)
-            uploaded_bytes += sz
-            chunk_queue.task_done()
+            batch_items = [first_item]
+            for _ in range(ul_pipeline - 1):
+                try:
+                    nxt = chunk_queue.get_nowait()
+                    if nxt is None:
+                        chunk_queue.put_nowait(None)
+                        break
+                    batch_items.append(nxt)
+                except asyncio.QueueEmpty:
+                    break
 
-            # ၂.၈ စက္ကန့်တစ်ကြိမ် ချောမွေ့သော Progress Bar နှင့် Chat Action ပြသခြင်း
+            sizes = await asyncio.gather(*(
+                upload_single_part(ul_sender, is_big, file_id, p_idx, total_parts, c_data)
+                for p_idx, c_data in batch_items
+            ))
+
+            uploaded_bytes += sum(sizes)
+            for _ in batch_items:
+                chunk_queue.task_done()
+
             now = time.time()
-            if now - last_edit_time[0] >= 2.8:
+            if now - last_edit_time[0] >= 2.6:
                 last_edit_time[0] = now
                 elapsed = max(now - start_time, 0.1)
                 speed_bps = uploaded_bytes / elapsed
                 speed_mb = speed_bps / (1024 * 1024)
-                pct = min(99.9, (uploaded_bytes * 100) / file_size)
+                pct = min(99.0, (uploaded_bytes * 100) / file_size)
                 curr_mb = uploaded_bytes / (1024 * 1024)
                 tot_mb = file_size / (1024 * 1024)
                 rem_sec = (file_size - uploaded_bytes) / max(speed_bps, 1)
 
-                bar = make_progress_bar(pct)
-                header = f"🔓 **ပို့စ်ကို ပြန်လည်ပေးပို့နေပါသည်...** {step_label}".strip()
-
+                bar_line = make_block_bar(pct)
                 asyncio.create_task(send_chat_upload_action(notify_bot, is_video, int(pct)))
                 try:
                     await notify_bot.edit_message(
                         CHAT_ID,
                         STATUS_MSG_ID,
-                        f"{header}\n\n"
-                        f"{bar} `{pct:.1f}%`\n"
-                        f"📦 `{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`\n"
-                        f"⚡ `{speed_mb:.1f} MB/s` • ⏳ `{format_eta(rem_sec)}`"
+                        f"⚙️ **Processing... ({step_counter})**\n"
+                        f"`{bar_line}`\n\n"
+                        f"🚀 **Mode:** `{mode_badge}`\n"
+                        f"📦 **Size:** `{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`\n"
+                        f"⚡ **Speed:** `{speed_mb:.1f} MB/s` • ⏳ `{format_eta(rem_sec)}`"
                     )
                 except Exception:
                     pass
@@ -368,7 +415,7 @@ async def save_cache_record(
             f"👤 **User ID:** `{USER_ID}`\n"
             f"🔗 **Source:** `{SOURCE_LINK}` (Post `{msg_id}`)\n"
             f"📦 **Size:** `{file_size / (1024 * 1024):.2f} MB`",
-            reply_to=dump_msg.id if hasattr(dump_msg_id, 'id') else dump_msg_id
+            reply_to=dump_msg_id.id if hasattr(dump_msg_id, 'id') else dump_msg_id
         )
         cache_key = f"{peer_key}:{msg_id}"
         await cache_col.update_one(
@@ -408,6 +455,9 @@ async def process_cloning():
         await bot_client.disconnect()
         await mongo.close()
         return
+
+    is_vip_mode = bool(user_doc.get("is_vip")) or (WORKERS >= 10)
+    mode_badge = f"💎 VIP Turbo ({WORKERS}x Workers)" if is_vip_mode else f"⚡ Standard ({WORKERS}x Workers)"
 
     upload_client = bot_client
     use_helper_bridge = False
@@ -454,11 +504,11 @@ async def process_cloning():
     try:
         total_posts = len(msg_ids)
         for idx, msg_id in enumerate(msg_ids, start=1):
-            step_label = f"`[{idx}/{total_posts}]`" if total_posts > 1 else ""
+            step_counter = f"{idx}/{total_posts}"
             msg = await user_client.get_messages(peer, ids=msg_id)
 
             if not msg:
-                await bot_client.send_message(CHAT_ID, f"⚠️ {step_label} ပို့စ်နံပါတ် `{msg_id}` ကို ရှာမတွေ့ပါ။")
+                await bot_client.send_message(CHAT_ID, f"⚠️ `({step_counter})` ပို့စ်နံပါတ် `{msg_id}` ကို ရှာမတွေ့ပါ။")
                 continue
 
             # ၁။ စာသားသက်သက်
@@ -475,7 +525,7 @@ async def process_cloning():
             if f_size > max_allowed_bytes:
                 await bot_client.send_message(
                     CHAT_ID,
-                    f"⚠️ {step_label} ပို့စ် `{msg_id}` ၏ ဖိုင်ဆိုဒ် (`{f_size / (1024 * 1024):.1f} MB`) သည် သင်၏ Limit (`{MAX_MB} MB`) ထက် ကျော်လွန်နေပါသည်။"
+                    f"⚠️ `({step_counter})` ပို့စ် `{msg_id}` ၏ ဖိုင်ဆိုဒ် (`{f_size / (1024 * 1024):.1f} MB`) သည် သင်၏ Limit (`{MAX_MB} MB`) ထက် ကျော်လွန်နေပါသည်။"
                 )
                 continue
 
@@ -484,7 +534,9 @@ async def process_cloning():
                 await bot_client.edit_message(
                     CHAT_ID,
                     STATUS_MSG_ID,
-                    f"🔓 **ပို့စ်ကို ပြန်လည်ပေးပို့နေပါသည်...** {step_label}\n\n▰▰▰▰▰▰▰▰▱▱ `85%`"
+                    f"⚙️ **Processing... ({step_counter})**\n"
+                    f"`{make_block_bar(80)}`\n\n"
+                    f"🚀 **Mode:** `{mode_badge}`"
                 )
                 ram_file = io.BytesIO()
                 await safe_download_media(user_client, msg, file=ram_file)
@@ -536,13 +588,14 @@ async def process_cloning():
             if not has_filename:
                 attributes.append(DocumentAttributeFilename(file_name=file_name))
 
-            asyncio.create_task(send_chat_upload_action(bot_client, is_video, 10))
+            asyncio.create_task(send_chat_upload_action(bot_client, is_video, 5))
             await bot_client.edit_message(
                 CHAT_ID,
                 STATUS_MSG_ID,
-                f"🔓 **ပို့စ်ကို ပြန်လည်ပေးပို့နေပါသည်...** {step_label}\n\n"
-                f"▱▱▱▱▱▱▱▱▱▱ `0.0%`\n"
-                f"📦 `0.0 MB` / `{size_mb:.1f} MB`"
+                f"⚙️ **Processing... ({step_counter})**\n"
+                f"`{make_block_bar(0)}`\n\n"
+                f"🚀 **Mode:** `{mode_badge}`\n"
+                f"📦 **Size:** `0.0 MB` / `{size_mb:.1f} MB`"
             )
 
             uploaded_thumb = None
@@ -556,24 +609,28 @@ async def process_cloning():
                 except Exception:
                     uploaded_thumb = None
 
-            input_file = await asymmetric_parallel_stream(
+            input_file = await adaptive_pipelined_stream(
                 pool=sender_pool,
                 user_client=user_client,
                 upload_client=upload_client,
                 notify_bot=bot_client,
                 document=doc,
                 file_name=file_name,
-                step_label=step_label,
+                step_counter=step_counter,
                 worker_count=WORKERS,
+                is_vip_mode=is_vip_mode,
+                mode_badge=mode_badge,
                 is_video=is_video
             )
 
             await bot_client.edit_message(
                 CHAT_ID,
                 STATUS_MSG_ID,
-                f"✨ **လက်ခံရရှိရန် အသင့်ဖြစ်ပါပြီ...** {step_label}\n\n"
-                f"▰▰▰▰▰▰▰▰▰▰ `100%`\n"
-                f"📦 `{size_mb:.1f} MB` / `{size_mb:.1f} MB`"
+                f"⚙️ **Processing... ({step_counter})**\n"
+                f"`{make_block_bar(100)}`\n\n"
+                f"🚀 **Mode:** `{mode_badge}`\n"
+                f"📦 **Size:** `{size_mb:.1f} MB` / `{size_mb:.1f} MB`\n"
+                f"✨ **ပို့စ်ကို လက်ခံရရှိရန် အသင့်ဖြစ်ပါပြီ...**"
             )
 
             media = InputMediaUploadedDocument(
