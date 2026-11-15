@@ -22,6 +22,7 @@ from telethon.tl.functions import InvokeWithLayerRequest
 from telethon.tl.functions.help import GetConfigRequest
 from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
 from telethon.tl.functions.upload import GetFileRequest, SaveFilePartRequest, SaveBigFilePartRequest
+from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import (
     PeerChannel,
     InputDocumentFileLocation,
@@ -29,9 +30,10 @@ from telethon.tl.types import (
     InputFileBig,
     InputMediaUploadedDocument,
     DocumentAttributeVideo,
-    DocumentAttributeFilename
+    DocumentAttributeFilename,
+    SendMessageUploadVideoAction,
+    SendMessageUploadDocumentAction
 )
-from telethon.errors import FloodWaitError, RPCError
 
 # ==========================================
 # ENVIRONMENT & PAYLOAD VARIABLES
@@ -55,13 +57,20 @@ HELPER_BOT_ID = int(os.environ.get("HELPER_BOT_ID", "0") or "0")
 PART_SIZE = 512 * 1024  # 512 KB
 
 # ==========================================
-# NON-PREMIUM FLOOD WAIT PARSER & HANDLER
+# UI FORMATTING & NON-PREMIUM WAIT HANDLER
 # ==========================================
+def make_progress_bar(pct: float, length: int = 10) -> str:
+    filled = min(length, max(0, int(round((pct / 100) * length))))
+    return "▰" * filled + "▱" * (length - filled)
+
+def format_eta(seconds: float) -> str:
+    sec = max(1, int(seconds))
+    if sec < 60:
+        return f"{sec} စက္ကန့်ခန့်"
+    mins, rem_s = divmod(sec, 60)
+    return f"{mins} မိနစ် {rem_s} စက္ကန့်ခန့်"
+
 def extract_wait_seconds(err: Exception) -> float:
-    """
-    Telegram ၏ FloodWaitError နှင့် 'A wait of X seconds is required in non-premium accounts'
-    အမှားများမှ စောင့်ဆိုင်းရမည့် စက္ကန့်အတိအကျကို ဆွဲထုတ်ပေးသည့် Function
-    """
     if hasattr(err, "seconds") and getattr(err, "seconds"):
         return float(err.seconds)
     msg = str(err)
@@ -71,7 +80,6 @@ def extract_wait_seconds(err: Exception) -> float:
     return 0.0
 
 async def safe_download_media(client: TelegramClient, msg, **kwargs):
-    """ပုံအသေးနှင့် Thumbnail ဒေါင်းလုဒ်ဆွဲရာတွင် Non-Premium Wait ထိပါက အလိုအလျောက် စောင့်ပေးခြင်း"""
     for attempt in range(8):
         try:
             return await client.download_media(msg, **kwargs)
@@ -93,8 +101,16 @@ async def resolve_dump_channel(client: TelegramClient):
         raw_id = int(str(abs(DUMP_CHANNEL_ID))[3:]) if str(abs(DUMP_CHANNEL_ID)).startswith("100") else abs(DUMP_CHANNEL_ID)
         return await client.get_input_entity(PeerChannel(raw_id))
 
+async def send_chat_upload_action(bot_client: TelegramClient, is_video: bool, pct: int = 50):
+    """Telegram Chat ၏ အပေါ်ဆုံးအတန်းတွင် 'Sending video...' သို့မဟုတ် 'Sending file...' ပေါ်စေရန်"""
+    try:
+        action = SendMessageUploadVideoAction(progress=pct) if is_video else SendMessageUploadDocumentAction(progress=pct)
+        await bot_client(SetTypingRequest(peer=CHAT_ID, action=action))
+    except Exception:
+        pass
+
 # ==========================================
-# PERSISTENT PARALLEL MTPROTO SENDER POOL
+# FAST PARALLEL MTPROTO SENDER POOL (0.8s Handshake)
 # ==========================================
 class PersistentSenderPool:
     def __init__(self):
@@ -137,7 +153,8 @@ class PersistentSenderPool:
             senders.append(first_sender)
 
         remaining = count - len(senders)
-        for _ in range(remaining):
+
+        async def connect_single():
             s = MTProtoSender(auth_key, loggers=client._log)
             await s.connect(
                 client._connection(
@@ -147,8 +164,11 @@ class PersistentSenderPool:
             )
             client._init_request.query = GetConfigRequest()
             await s.send(InvokeWithLayerRequest(LAYER, client._init_request))
-            senders.append(s)
+            return s
 
+        # Connection အားလုံးကို တန်းစီမစောင့်ဘဲ တစ်ပြိုင်နက်တည်း (0.8s အတွင်း) ချိတ်ဆက်ခြင်း
+        extra_senders = await asyncio.gather(*(connect_single() for _ in range(remaining)))
+        senders.extend(extra_senders)
         return senders
 
     async def close_all(self):
@@ -162,7 +182,7 @@ class PersistentSenderPool:
                 pass
 
 # ==========================================
-# NON-PREMIUM SAFE TURBO STREAMING ENGINE
+# SMOOTH STREAMING ENGINE
 # ==========================================
 async def fetch_single_part(dl_sender: MTProtoSender, location, part_idx: int, file_size: int):
     offset = part_idx * PART_SIZE
@@ -184,8 +204,7 @@ async def fetch_single_part(dl_sender: MTProtoSender, location, part_idx: int, f
         except Exception as e:
             wait_sec = extract_wait_seconds(e)
             if wait_sec > 0:
-                # Non-premium 3 seconds wait တက်ပါက ကွက်တိစောင့်ဆိုင်းပြီး ပြန်ဆွဲမည်
-                jitter = random.uniform(0.5, 1.5)
+                jitter = random.uniform(0.4, 1.2)
                 await asyncio.sleep(wait_sec + jitter)
             else:
                 if attempt == 14:
@@ -229,12 +248,8 @@ async def asymmetric_parallel_stream(
     file_name: str,
     step_label: str,
     worker_count: int,
-    helper_label: str
+    is_video: bool
 ):
-    """
-    Non-Premium User အကောင့်များအတွက် Download ဘက်တွင် 6-8 Senders (Paced) ဖြင့် ဆွဲပြီး
-    Helper Bot Upload ဘက်တွင် Workers အပြည့်ဖြင့် တင်ပို့ပေးသော စနစ်
-    """
     file_size = document.size
     total_parts = math.ceil(file_size / PART_SIZE)
     file_id = helpers.generate_random_long()
@@ -247,8 +262,6 @@ async def asymmetric_parallel_stream(
         thumb_size=""
     )
 
-    # Non-Premium အကောင့်များ Limit မထိစေရန် Download Sender ကို အများဆုံး 8 ခုသာ သုံးပြီး
-    # Upload Bot ဘက်တွင်သာ worker_count အပြည့် (16 အထိ) သုံးပါမည်
     dl_worker_count = min(8, worker_count, total_parts)
     ul_worker_count = min(worker_count, total_parts)
 
@@ -267,9 +280,8 @@ async def asymmetric_parallel_stream(
     start_time = time.time()
     last_edit_time = [0.0]
 
-    async def dl_producer( idx: int, dl_sender: MTProtoSender):
-        # Worker များ တစ်ပြိုင်နက်တည်း စုပြုံမတောင်းစေရန် အစတွင် 0.15s စီ ခြား၍ စတင်ခြင်း
-        await asyncio.sleep(idx * 0.15)
+    async def dl_producer(idx: int, dl_sender: MTProtoSender):
+        await asyncio.sleep(idx * 0.12)
         while not part_queue.empty():
             try:
                 part_idx = part_queue.get_nowait()
@@ -293,21 +305,30 @@ async def asymmetric_parallel_stream(
             uploaded_bytes += sz
             chunk_queue.task_done()
 
+            # ၂.၈ စက္ကန့်တစ်ကြိမ် ချောမွေ့သော Progress Bar နှင့် Chat Action ပြသခြင်း
             now = time.time()
-            if now - last_edit_time[0] >= 4.0:
+            if now - last_edit_time[0] >= 2.8:
                 last_edit_time[0] = now
                 elapsed = max(now - start_time, 0.1)
-                speed_mb = (uploaded_bytes / (1024 * 1024)) / elapsed
-                pct = (uploaded_bytes * 100) / file_size
+                speed_bps = uploaded_bytes / elapsed
+                speed_mb = speed_bps / (1024 * 1024)
+                pct = min(99.9, (uploaded_bytes * 100) / file_size)
                 curr_mb = uploaded_bytes / (1024 * 1024)
                 tot_mb = file_size / (1024 * 1024)
+                rem_sec = (file_size - uploaded_bytes) / max(speed_bps, 1)
+
+                bar = make_progress_bar(pct)
+                header = f"🔓 **ပို့စ်ကို ပြန်လည်ပေးပို့နေပါသည်...** {step_label}".strip()
+
+                asyncio.create_task(send_chat_upload_action(notify_bot, is_video, int(pct)))
                 try:
                     await notify_bot.edit_message(
                         CHAT_ID,
                         STATUS_MSG_ID,
-                        f"⚡ {step_label} **Turbo Stream ({dl_worker_count}DL/{ul_worker_count}UL | {helper_label})**\n"
-                        f"📊 **Progress:** `{pct:.1f}%` (`{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`)\n"
-                        f"🚀 **Speed:** `{speed_mb:.2f} MB/s`"
+                        f"{header}\n\n"
+                        f"{bar} `{pct:.1f}%`\n"
+                        f"📦 `{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`\n"
+                        f"⚡ `{speed_mb:.1f} MB/s` • ⏳ `{format_eta(rem_sec)}`"
                     )
                 except Exception:
                     pass
@@ -347,7 +368,7 @@ async def save_cache_record(
             f"👤 **User ID:** `{USER_ID}`\n"
             f"🔗 **Source:** `{SOURCE_LINK}` (Post `{msg_id}`)\n"
             f"📦 **Size:** `{file_size / (1024 * 1024):.2f} MB`",
-            reply_to=dump_msg_id
+            reply_to=dump_msg.id if hasattr(dump_msg_id, 'id') else dump_msg_id
         )
         cache_key = f"{peer_key}:{msg_id}"
         await cache_col.update_one(
@@ -389,7 +410,6 @@ async def process_cloning():
         return
 
     upload_client = bot_client
-    helper_label = "MainBot"
     use_helper_bridge = False
     helper_dump_entity = None
 
@@ -406,7 +426,6 @@ async def process_cloning():
                         helper_dump_entity = await resolve_dump_channel(h_client)
                         if helper_dump_entity:
                             upload_client = h_client
-                            helper_label = f"@{h['username']}"
                             use_helper_bridge = True
                     except Exception as e:
                         print(f"Helper bot init fallback to main bot: {e}")
@@ -435,7 +454,7 @@ async def process_cloning():
     try:
         total_posts = len(msg_ids)
         for idx, msg_id in enumerate(msg_ids, start=1):
-            step_label = f"[{idx}/{total_posts}]" if total_posts > 1 else ""
+            step_label = f"`[{idx}/{total_posts}]`" if total_posts > 1 else ""
             msg = await user_client.get_messages(peer, ids=msg_id)
 
             if not msg:
@@ -462,7 +481,11 @@ async def process_cloning():
 
             # ၂။ ပုံအသေး သို့မဟုတ် 2MB အောက် ဖိုင်အသေးများ
             if not msg.document or f_size < 2 * 1024 * 1024:
-                await bot_client.edit_message(CHAT_ID, STATUS_MSG_ID, f"⚡ {step_label} **ဖိုင်အသေးကို လွှဲပြောင်းနေပါသည်...**")
+                await bot_client.edit_message(
+                    CHAT_ID,
+                    STATUS_MSG_ID,
+                    f"🔓 **ပို့စ်ကို ပြန်လည်ပေးပို့နေပါသည်...** {step_label}\n\n▰▰▰▰▰▰▰▰▱▱ `85%`"
+                )
                 ram_file = io.BytesIO()
                 await safe_download_media(user_client, msg, file=ram_file)
                 ram_file.seek(0)
@@ -484,35 +507,20 @@ async def process_cloning():
                 completed_files += 1
                 completed_bytes += f_size
                 if total_posts > 1:
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(1.2)
                 continue
 
             # ၃။ 2MB အထက် ဖိုင်ကြီးများ
             doc = msg.document
             file_name = getattr(msg.file, "name", None) or f"video_{msg_id}{getattr(msg.file, 'ext', '') or '.mp4'}"
-
-            await bot_client.edit_message(
-                CHAT_ID,
-                STATUS_MSG_ID,
-                f"🚀 {step_label} **Turbo Stream ({helper_label}) စတင်နေပါသည်...**\n"
-                f"📦 **ဖိုင်အရွယ်အစား:** `{doc.size / (1024 * 1024):.1f} MB`"
-            )
-
-            uploaded_thumb = None
-            if doc.thumbs:
-                try:
-                    thumb_buf = io.BytesIO()
-                    await safe_download_media(user_client, msg, thumb=-1, file=thumb_buf)
-                    thumb_buf.seek(0)
-                    thumb_buf.name = "thumb.jpg"
-                    uploaded_thumb = await upload_client.upload_file(thumb_buf)
-                except Exception:
-                    uploaded_thumb = None
+            size_mb = doc.size / (1024 * 1024)
 
             attributes = []
             has_filename = False
+            is_video = False
             for attr in doc.attributes:
                 if isinstance(attr, DocumentAttributeVideo):
+                    is_video = True
                     attributes.append(DocumentAttributeVideo(
                         duration=attr.duration,
                         w=attr.w,
@@ -528,6 +536,26 @@ async def process_cloning():
             if not has_filename:
                 attributes.append(DocumentAttributeFilename(file_name=file_name))
 
+            asyncio.create_task(send_chat_upload_action(bot_client, is_video, 10))
+            await bot_client.edit_message(
+                CHAT_ID,
+                STATUS_MSG_ID,
+                f"🔓 **ပို့စ်ကို ပြန်လည်ပေးပို့နေပါသည်...** {step_label}\n\n"
+                f"▱▱▱▱▱▱▱▱▱▱ `0.0%`\n"
+                f"📦 `0.0 MB` / `{size_mb:.1f} MB`"
+            )
+
+            uploaded_thumb = None
+            if doc.thumbs:
+                try:
+                    thumb_buf = io.BytesIO()
+                    await safe_download_media(user_client, msg, thumb=-1, file=thumb_buf)
+                    thumb_buf.seek(0)
+                    thumb_buf.name = "thumb.jpg"
+                    uploaded_thumb = await upload_client.upload_file(thumb_buf)
+                except Exception:
+                    uploaded_thumb = None
+
             input_file = await asymmetric_parallel_stream(
                 pool=sender_pool,
                 user_client=user_client,
@@ -537,7 +565,15 @@ async def process_cloning():
                 file_name=file_name,
                 step_label=step_label,
                 worker_count=WORKERS,
-                helper_label=helper_label
+                is_video=is_video
+            )
+
+            await bot_client.edit_message(
+                CHAT_ID,
+                STATUS_MSG_ID,
+                f"✨ **လက်ခံရရှိရန် အသင့်ဖြစ်ပါပြီ...** {step_label}\n\n"
+                f"▰▰▰▰▰▰▰▰▰▰ `100%`\n"
+                f"📦 `{size_mb:.1f} MB` / `{size_mb:.1f} MB`"
             )
 
             media = InputMediaUploadedDocument(
@@ -579,7 +615,7 @@ async def process_cloning():
             completed_bytes += doc.size
 
             if total_posts > 1:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.5)
 
         if completed_files > 0:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
