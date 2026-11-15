@@ -3,6 +3,7 @@ import os
 import re
 import math
 import time
+import socket
 import random
 import asyncio
 from datetime import datetime, timezone
@@ -50,14 +51,16 @@ STATUS_MSG_ID = int(os.environ.get("STATUS_MSG_ID", "0"))
 PEER_ID = os.environ.get("PEER_ID", "")
 MSG_IDS_RAW = os.environ.get("MSG_IDS", "")
 MAX_MB = int(os.environ.get("MAX_MB", "500"))
-WORKERS = int(os.environ.get("WORKERS", "16"))
+WORKERS = int(os.environ.get("WORKERS", "20"))
 SOURCE_LINK = os.environ.get("SOURCE_LINK", "")
 HELPER_BOT_ID = int(os.environ.get("HELPER_BOT_ID", "0") or "0")
 
-PART_SIZE = 512 * 1024  # 512 KB
+# 1MB Download Block & 512KB Upload Part (MTProto Max Specs)
+DL_BLOCK_SIZE = 1024 * 1024  # 1 MB (1048576 bytes) - RPC အကြိမ်ရေ 50% လျှော့ချပေးသည်
+UL_PART_SIZE = 512 * 1024    # 512 KB (524288 bytes) - SaveBigFilePart Max Size
 
 # ==========================================
-# BLOCK PROGRESS BAR [███░░░░░░░] 30% & HELPERS
+# UI HELPERS & SOCKET TUNING
 # ==========================================
 def make_block_bar(pct: float, length: int = 10) -> str:
     filled = min(length, max(0, int(round((pct / 100) * length))))
@@ -79,6 +82,19 @@ def extract_wait_seconds(err: Exception) -> float:
     if match:
         return float(match.group(1))
     return 0.0
+
+def tune_sender_socket(sender: MTProtoSender):
+    """Socket တွင် TCP_NODELAY နှင့် High-Speed Buffer ဖွင့်ပေးခြင်း"""
+    try:
+        conn = getattr(sender, "_connection", None)
+        sock = getattr(conn, "socket", None)
+        if sock is not None:
+            raw_sock = getattr(sock, "_sock", sock)
+            raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+            raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+    except Exception:
+        pass
 
 async def safe_download_media(client: TelegramClient, msg, **kwargs):
     for attempt in range(8):
@@ -110,17 +126,21 @@ async def send_chat_upload_action(bot_client: TelegramClient, is_video: bool, pc
         pass
 
 # ==========================================
-# FAST PARALLEL MTPROTO SENDER POOL
+# MULTI-AUTHKEY STRIPED SENDER POOL
 # ==========================================
-class PersistentSenderPool:
+class StripedSenderPool:
+    """
+    Download ဘက်တွင် Independent Auth-Keys အများအပြား ခွဲထုတ်ပြီး Rate-Limit ကို ကျော်လွှားကာ
+    Upload ဘက်တွင် Parallel Connections အပြည့်ချိတ်ဆက်ပေးသည့် စနစ်
+    """
     def __init__(self):
         self.dl_pools = {}
         self.ul_pool = []
 
-    async def get_dl_senders(self, user_client: TelegramClient, dc_id: int, count: int):
+    async def get_dl_senders(self, user_client: TelegramClient, dc_id: int, count: int, is_vip: bool):
         if dc_id in self.dl_pools and len(self.dl_pools[dc_id]) >= count:
             return self.dl_pools[dc_id][:count]
-        senders = await self._create_pool(user_client, dc_id, count)
+        senders = await self._create_striped_dl_pool(user_client, dc_id, count, is_vip)
         self.dl_pools[dc_id] = senders
         return senders
 
@@ -128,47 +148,81 @@ class PersistentSenderPool:
         dc_id = upload_client.session.dc_id
         if len(self.ul_pool) >= count:
             return self.ul_pool[:count]
-        self.ul_pool = await self._create_pool(upload_client, dc_id, count)
+        self.ul_pool = await self._create_ul_pool(upload_client, dc_id, count)
         return self.ul_pool
 
-    async def _create_pool(self, client: TelegramClient, dc_id: int, count: int):
+    async def _create_independent_auth_sender(self, client: TelegramClient, dc):
+        """သီးခြား Auth-Key အသစ်တစ်ခု တည်ဆောက်ပြီး Authorize လုပ်ခြင်း"""
+        s = MTProtoSender(None, loggers=client._log)
+        await s.connect(
+            client._connection(
+                dc.ip_address, dc.port, dc.id,
+                loggers=client._log, proxy=client._proxy
+            )
+        )
+        tune_sender_socket(s)
+        auth = await client(ExportAuthorizationRequest(dc.id))
+        client._init_request.query = ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
+        await s.send(InvokeWithLayerRequest(LAYER, client._init_request))
+        return s
+
+    async def _clone_sender_from_key(self, client: TelegramClient, dc, auth_key):
+        s = MTProtoSender(auth_key, loggers=client._log)
+        await s.connect(
+            client._connection(
+                dc.ip_address, dc.port, dc.id,
+                loggers=client._log, proxy=client._proxy
+            )
+        )
+        tune_sender_socket(s)
+        client._init_request.query = GetConfigRequest()
+        await s.send(InvokeWithLayerRequest(LAYER, client._init_request))
+        return s
+
+    async def _create_striped_dl_pool(self, client: TelegramClient, dc_id: int, count: int, is_vip: bool):
         dc = await client._get_dc(dc_id)
         senders = []
-        auth_key = None
+        auth_keys = []
 
+        # ၁။ ပထမဆုံး Base Auth-Key ရယူခြင်း
         if dc_id == client.session.dc_id:
-            auth_key = client.session.auth_key
+            auth_keys.append(client.session.auth_key)
         else:
-            first_sender = MTProtoSender(None, loggers=client._log)
-            await first_sender.connect(
-                client._connection(
-                    dc.ip_address, dc.port, dc.id,
-                    loggers=client._log, proxy=client._proxy
-                )
-            )
-            auth = await client(ExportAuthorizationRequest(dc_id))
-            client._init_request.query = ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
-            await first_sender.send(InvokeWithLayerRequest(LAYER, client._init_request))
-            auth_key = first_sender.auth_key
-            senders.append(first_sender)
+            first_s = await self._create_independent_auth_sender(client, dc)
+            senders.append(first_s)
+            auth_keys.append(first_s.auth_key)
 
+        # ၂။ VIP Mode ဖြစ်ပါက သီးခြား Independent Auth-Keys (၄ ခုအထိ) ထပ်မံတည်ဆောက်ခြင်း
+        # (Rate-Limit Bucket များ သီးခြားစီ ဖြစ်သွားစေရန်)
+        target_extra_keys = 4 if is_vip else 0
+        for _ in range(target_extra_keys):
+            if len(senders) >= count:
+                break
+            try:
+                ind_s = await self._create_independent_auth_sender(client, dc)
+                senders.append(ind_s)
+                auth_keys.append(ind_s.auth_key)
+            except Exception:
+                # Telegram ဘက်မှ Export ကန့်သတ်ပါက Error မတက်ဘဲ ရှိပြီးသား Key များကို သုံးမည်
+                break
+
+        # ၃။ ကျန်ရှိသော Connections များကို ရရှိထားသော Auth-Keys များပေါ်တွင် အညီအမျှ ခွဲဝေချိတ်ဆက်ခြင်း
         remaining = count - len(senders)
+        if remaining > 0:
+            tasks = [
+                self._clone_sender_from_key(client, dc, auth_keys[i % len(auth_keys)])
+                for i in range(remaining)
+            ]
+            cloned = await asyncio.gather(*tasks)
+            senders.extend(cloned)
 
-        async def connect_single():
-            s = MTProtoSender(auth_key, loggers=client._log)
-            await s.connect(
-                client._connection(
-                    dc.ip_address, dc.port, dc.id,
-                    loggers=client._log, proxy=client._proxy
-                )
-            )
-            client._init_request.query = GetConfigRequest()
-            await s.send(InvokeWithLayerRequest(LAYER, client._init_request))
-            return s
-
-        extra_senders = await asyncio.gather(*(connect_single() for _ in range(remaining)))
-        senders.extend(extra_senders)
         return senders
+
+    async def _create_ul_pool(self, client: TelegramClient, dc_id: int, count: int):
+        dc = await client._get_dc(dc_id)
+        auth_key = client.session.auth_key
+        tasks = [self._clone_sender_from_key(client, dc, auth_key) for _ in range(count)]
+        return list(await asyncio.gather(*tasks))
 
     async def close_all(self):
         all_senders = list(self.ul_pool)
@@ -181,49 +235,44 @@ class PersistentSenderPool:
                 pass
 
 # ==========================================
-# ADAPTIVE PIPELINED TURBO STREAMING ENGINE
+# 1MB BLOCK DOWNLOAD + WORK-STEALING ENGINE
 # ==========================================
-async def fetch_single_part(dl_sender: MTProtoSender, location, part_idx: int, file_size: int, throttled_flag: list):
-    offset = part_idx * PART_SIZE
-    expected_len = min(PART_SIZE, file_size - offset)
+async def download_1mb_block_once(dl_sender: MTProtoSender, location, block_idx: int, file_size: int) -> bytes:
+    """
+    1MB (1048576 bytes) ကို တစ်ကြိမ်တည်းဖြင့် ဆွဲထုတ်ခြင်း။
+    DC မှ 512KB သာ ပြန်ပေးပါက ကျန် 512KB ကို Boundary မကျော်ဘဲ အလိုအလျောက် ဆက်ဆွဲပေးသည်။
+    """
+    offset = block_idx * DL_BLOCK_SIZE
+    expected_len = min(DL_BLOCK_SIZE, file_size - offset)
+    buf = bytearray()
+    curr_off = offset
 
-    for attempt in range(16):
-        try:
-            buf = bytearray()
-            curr_off = offset
-            while len(buf) < expected_len:
-                res = await dl_sender.send(
-                    GetFileRequest(location, offset=curr_off, limit=PART_SIZE)
-                )
-                if not res.bytes:
-                    break
-                buf.extend(res.bytes)
-                curr_off += len(res.bytes)
-            return part_idx, bytes(buf[:expected_len])
-        except Exception as e:
-            wait_sec = extract_wait_seconds(e)
-            if wait_sec > 0:
-                throttled_flag[0] = True
-                jitter = random.uniform(0.3, 1.0)
-                await asyncio.sleep(wait_sec + jitter)
-            else:
-                if attempt == 15:
-                    raise
-                await asyncio.sleep(0.8 + (attempt * 0.4))
+    while len(buf) < expected_len:
+        # 1MB Boundary ဖြစ်လျှင် 1MB တောင်းပြီး၊ +512KB နေရာဖြစ်လျှင် 512KB တောင်းမည် (OFFSET_INVALID လုံးဝမဖြစ်စေရန်)
+        req_limit = DL_BLOCK_SIZE if (curr_off % DL_BLOCK_SIZE == 0) else UL_PART_SIZE
+        res = await dl_sender.send(
+            GetFileRequest(location, offset=curr_off, limit=req_limit)
+        )
+        if not res.bytes:
+            break
+        buf.extend(res.bytes)
+        curr_off += len(res.bytes)
 
-async def upload_single_part(
+    return bytes(buf[:expected_len])
+
+async def upload_512kb_part(
     ul_sender: MTProtoSender,
     is_big: bool,
     file_id: int,
     part_idx: int,
-    total_parts: int,
+    total_ul_parts: int,
     chunk_data: bytes
 ):
-    for attempt in range(12):
+    for attempt in range(14):
         try:
             if is_big:
                 await ul_sender.send(
-                    SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk_data)
+                    SaveBigFilePartRequest(file_id, part_idx, total_ul_parts, chunk_data)
                 )
             else:
                 await ul_sender.send(
@@ -233,14 +282,14 @@ async def upload_single_part(
         except Exception as e:
             wait_sec = extract_wait_seconds(e)
             if wait_sec > 0:
-                await asyncio.sleep(wait_sec + 1.0)
+                await asyncio.sleep(wait_sec + 0.5)
             else:
-                if attempt == 11:
+                if attempt == 13:
                     raise
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.5)
 
-async def adaptive_pipelined_stream(
-    pool: PersistentSenderPool,
+async def ultra_turbo_stream(
+    pool: StripedSenderPool,
     user_client: TelegramClient,
     upload_client: TelegramClient,
     notify_bot: TelegramClient,
@@ -252,12 +301,9 @@ async def adaptive_pipelined_stream(
     mode_badge: str,
     is_video: bool
 ):
-    """
-    VIP Mode တွင် 16x-24x Workers အပြည့်နှင့် Adaptive Pipelining (Batch 2x DL / 4x UL) သုံးပြီး
-    Standard Mode တွင် သတ်မှတ်ထားသော Free Workers (ဥပမာ 4x) ဖြင့် လုပ်ဆောင်ပေးသည့် အင်ဂျင်
-    """
     file_size = document.size
-    total_parts = math.ceil(file_size / PART_SIZE)
+    total_dl_blocks = math.ceil(file_size / DL_BLOCK_SIZE)
+    total_ul_parts = math.ceil(file_size / UL_PART_SIZE)
     file_id = helpers.generate_random_long()
     is_big = file_size > 10 * 1024 * 1024
 
@@ -268,63 +314,74 @@ async def adaptive_pipelined_stream(
         thumb_size=""
     )
 
-    # VIP ဖြစ်ပါက 16x/24x Workers အပြည့်ဖွင့်ပေးပြီး Free ဖြစ်ပါက Standard Workers သာ သုံးမည်
     if is_vip_mode:
-        dl_worker_count = min(worker_count, total_parts)
-        ul_worker_count = min(worker_count, total_parts)
-        dl_pipeline = 2
+        dl_worker_count = min(worker_count, total_dl_blocks)
+        ul_worker_count = min(max(worker_count, 20), total_ul_parts)
         ul_pipeline = 4
     else:
-        dl_worker_count = min(worker_count, 6, total_parts)
-        ul_worker_count = min(worker_count, 6, total_parts)
-        dl_pipeline = 1
+        dl_worker_count = min(worker_count, 4, total_dl_blocks)
+        ul_worker_count = min(worker_count, 6, total_ul_parts)
         ul_pipeline = 2
 
     dl_senders, ul_senders = await asyncio.gather(
-        pool.get_dl_senders(user_client, document.dc_id, dl_worker_count),
+        pool.get_dl_senders(user_client, document.dc_id, dl_worker_count, is_vip_mode),
         pool.get_ul_senders(upload_client, ul_worker_count)
     )
 
-    part_queue = asyncio.Queue()
-    for part_idx in range(total_parts):
-        part_queue.put_nowait(part_idx)
+    # 1MB Download Blocks Queue
+    block_queue = asyncio.Queue()
+    for b_idx in range(total_dl_blocks):
+        block_queue.put_nowait((b_idx, 0))  # (block_idx, retry_count)
 
-    chunk_queue = asyncio.Queue(maxsize=ul_worker_count * ul_pipeline * 2)
+    # 512KB Upload Parts Queue (RAM Ring Buffer)
+    chunk_queue = asyncio.Queue(maxsize=ul_worker_count * ul_pipeline * 3)
 
     uploaded_bytes = 0
     start_time = time.time()
     last_edit_time = [0.0]
-    throttled_flag = [False]  # Non-Premium Wait ထိပါက Pipeline အလိုအလျောက် ချိန်ညှိရန်
 
     async def dl_producer(idx: int, dl_sender: MTProtoSender):
-        await asyncio.sleep(idx * 0.06)
-        while not part_queue.empty():
-            # Non-Premium Wait မထိသေးသရွေ့ VIP တွင် Pipelining (2x) ဖြင့် အမြန်ဆုံး ဆွဲမည်
-            curr_batch_size = 1 if throttled_flag[0] else dl_pipeline
-            batch_indices = []
-            for _ in range(curr_batch_size):
-                if part_queue.empty():
-                    break
-                try:
-                    batch_indices.append(part_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-
-            if not batch_indices:
+        # কানেကရှင်များ တစ်ချိန်တည်း မတိုက်မိစေရန် အစတွင် 0.04s စီ ခြား၍ စတင်ခြင်း
+        await asyncio.sleep(idx * 0.04)
+        while True:
+            try:
+                b_idx, retries = block_queue.get_nowait()
+            except asyncio.QueueEmpty:
                 break
 
-            results = await asyncio.gather(*(
-                fetch_single_part(dl_sender, location, p_idx, file_size, throttled_flag)
-                for p_idx in batch_indices
-            ))
+            try:
+                block_bytes = await download_1mb_block_once(dl_sender, location, b_idx, file_size)
 
-            for p_idx, c_data in results:
-                await chunk_queue.put((p_idx, c_data))
-                part_queue.task_done()
+                # 1MB Block ကို 512KB (၂) ပိုင်း ခွဲပြီး Upload Queue သို့ ချက်ချင်း ထည့်ပေးခြင်း
+                ul_idx_1 = b_idx * 2
+                part_1 = block_bytes[:UL_PART_SIZE]
+                await chunk_queue.put((ul_idx_1, part_1))
 
-            # Free User ဖြစ်ပါက Standard Speed ဖြစ်စေရန် အနည်းငယ် Pacing ထိန်းမည်
-            if not is_vip_mode:
-                await asyncio.sleep(0.08)
+                if len(block_bytes) > UL_PART_SIZE:
+                    ul_idx_2 = b_idx * 2 + 1
+                    part_2 = block_bytes[UL_PART_SIZE:]
+                    await chunk_queue.put((ul_idx_2, part_2))
+
+                block_queue.task_done()
+
+                if not is_vip_mode:
+                    await asyncio.sleep(0.12)
+
+            except Exception as e:
+                wait_sec = extract_wait_seconds(e)
+                if retries >= 18:
+                    block_queue.task_done()
+                    raise
+
+                # Work-Stealing: 3s Wait ထိပါက ဤ Block ကို Queue ထဲ ချက်ချင်းပြန်ထည့်ပေးပြီး
+                # အခြား အားနေသော Worker က ဝင်ဆွဲနိုင်အောင် လုပ်ပေးမည်
+                block_queue.put_nowait((b_idx, retries + 1))
+                block_queue.task_done()
+
+                if wait_sec > 0:
+                    await asyncio.sleep(wait_sec + random.uniform(0.2, 0.6))
+                else:
+                    await asyncio.sleep(0.6)
 
     async def ul_consumer(ul_sender: MTProtoSender):
         nonlocal uploaded_bytes
@@ -346,7 +403,7 @@ async def adaptive_pipelined_stream(
                     break
 
             sizes = await asyncio.gather(*(
-                upload_single_part(ul_sender, is_big, file_id, p_idx, total_parts, c_data)
+                upload_512kb_part(ul_sender, is_big, file_id, p_idx, total_ul_parts, c_data)
                 for p_idx, c_data in batch_items
             ))
 
@@ -355,7 +412,7 @@ async def adaptive_pipelined_stream(
                 chunk_queue.task_done()
 
             now = time.time()
-            if now - last_edit_time[0] >= 2.6:
+            if now - last_edit_time[0] >= 2.5:
                 last_edit_time[0] = now
                 elapsed = max(now - start_time, 0.1)
                 speed_bps = uploaded_bytes / elapsed
@@ -383,14 +440,18 @@ async def adaptive_pipelined_stream(
     producers = [asyncio.create_task(dl_producer(i, s)) for i, s in enumerate(dl_senders)]
     consumers = [asyncio.create_task(ul_consumer(s)) for s in ul_senders]
 
-    await asyncio.gather(*producers)
+    # Block အားလုံး (Re-queued များအပါအဝင်) ကုန်စင်အောင် စောင့်ဆိုင်းခြင်း
+    await block_queue.join()
+    for p in producers:
+        p.cancel()
+
     for _ in range(ul_worker_count):
         await chunk_queue.put(None)
     await asyncio.gather(*consumers)
 
     if is_big:
-        return InputFileBig(id=file_id, parts=total_parts, name=file_name)
-    return InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
+        return InputFileBig(id=file_id, parts=total_ul_parts, name=file_name)
+    return InputFile(id=file_id, parts=total_ul_parts, name=file_name, md5_checksum="")
 
 # ==========================================
 # DB CHANNEL CACHE SAVER
@@ -499,7 +560,7 @@ async def process_cloning():
     max_allowed_bytes = MAX_MB * 1024 * 1024
     completed_files = 0
     completed_bytes = 0
-    sender_pool = PersistentSenderPool()
+    sender_pool = StripedSenderPool()
 
     try:
         total_posts = len(msg_ids)
@@ -559,10 +620,10 @@ async def process_cloning():
                 completed_files += 1
                 completed_bytes += f_size
                 if total_posts > 1:
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(1.0)
                 continue
 
-            # ၃။ 2MB အထက် ဖိုင်ကြီးများ
+            # ၃။ 2MB အထက် ဖိုင်ကြီးများ (1MB Block + Multi-AuthKey + BBR)
             doc = msg.document
             file_name = getattr(msg.file, "name", None) or f"video_{msg_id}{getattr(msg.file, 'ext', '') or '.mp4'}"
             size_mb = doc.size / (1024 * 1024)
@@ -609,7 +670,7 @@ async def process_cloning():
                 except Exception:
                     uploaded_thumb = None
 
-            input_file = await adaptive_pipelined_stream(
+            input_file = await ultra_turbo_stream(
                 pool=sender_pool,
                 user_client=user_client,
                 upload_client=upload_client,
@@ -672,7 +733,7 @@ async def process_cloning():
             completed_bytes += doc.size
 
             if total_posts > 1:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.2)
 
         if completed_files > 0:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
