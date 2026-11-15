@@ -49,7 +49,6 @@ DUMP_CHANNEL_ID = int(os.environ.get("DUMP_CHANNEL_ID", "0"))
 WORKER_REPO_NAME = os.environ.get("WORKER_REPO_NAME", "standby-worker")
 WORKER_ID = f"{WORKER_REPO_NAME.split('/')[-1]}-{os.environ.get('GITHUB_RUN_ID', uuid.uuid4().hex[:6])}"
 
-# 5.3 Hours Standby Lifetime (GitHub 6h limit မပြည့်မီ အသစ်လဲလှယ်ရန်)
 MAX_DAEMON_LIFETIME = 19000
 PART_SIZE = 512 * 1024  # 512 KB
 
@@ -163,7 +162,6 @@ class PersistentSenderPool:
             auth_keys.append(first_sender.auth_key)
             senders.append(first_sender)
 
-        # Download ဘက်တွင် Rate-Limit မထိစေရန် Independent Auth-Keys (၃ ခုအထိ) ထပ်ပွားခြင်း
         if not is_upload:
             for _ in range(3):
                 if len(senders) >= count:
@@ -290,10 +288,6 @@ async def stream_document_with_shaper(
     mode_badge: str,
     is_video: bool
 ):
-    """
-    - VIP Mode: Sweet-Spot Paced Download + Unthrottled 16x-24x Pipelined Upload
-    - Free Mode: Token-Bucket Speed Limiter ဖြင့် Admin သတ်မှတ်ထားသော MB/s အတိုင်း အတိအကျ ထိန်းချုပ်ပေးသည်
-    """
     file_size = document.size
     total_parts = math.ceil(file_size / PART_SIZE)
     file_id = helpers.generate_random_long()
@@ -306,7 +300,6 @@ async def stream_document_with_shaper(
         thumb_size=""
     )
 
-    # Non-Premium Sweet-Spot: Download Connection 8-10 ခုထက် ပိုမဖွင့်ဘဲ Micro-Pacing ဖြင့် 3s Wait ကို ရှောင်ရှားမည်
     if is_vip_mode:
         dl_worker_count = min(10, worker_count, total_parts)
         ul_worker_count = min(worker_count, total_parts)
@@ -332,10 +325,8 @@ async def stream_document_with_shaper(
     start_time = time.time()
     last_edit_time = [0.0]
 
-    # Admin သတ်မှတ်ထားသော Free Max Speed (Bytes per second)
     max_speed_bps = (max_speed_mb * 1024 * 1024) if (max_speed_mb and max_speed_mb > 0 and not is_vip_mode) else 0
 
-    # Global Pacer Lock (Non-premium 3s wait မထိစေရန် Request များကို 35ms စီ ခြားပေးမည်)
     last_req_ts = [0.0]
     pacer_lock = asyncio.Lock()
 
@@ -348,7 +339,6 @@ async def stream_document_with_shaper(
             except asyncio.QueueEmpty:
                 break
 
-            # Sweet-Spot Micro-Pacer (တစ်ပြိုင်နက် Burst မဖြစ်စေရန်)
             async with pacer_lock:
                 now_p = time.time()
                 gap = 0.032 if is_vip_mode else 0.08
@@ -356,7 +346,6 @@ async def stream_document_with_shaper(
                     await asyncio.sleep(gap - (now_p - last_req_ts[0]))
                 last_req_ts[0] = time.time()
 
-            # Free User Bandwidth Shaper (Admin သတ်မှတ်ထားသော MB/s ထက် မကျော်စေရန် ထိန်းချုပ်ခြင်း)
             if max_speed_bps > 0:
                 elapsed_dl = max(time.time() - start_time, 0.05)
                 expected_time = downloaded_bytes / max_speed_bps
@@ -373,7 +362,6 @@ async def stream_document_with_shaper(
                 if retries >= 18:
                     part_queue.task_done()
                     raise
-                # Work-Stealing: 3s wait ထိပါက ချက်ချင်း Queue ထဲ ပြန်ထည့်ပြီး အခြား Worker ကို ပေးဆွဲမည်
                 part_queue.put_nowait((p_idx, retries + 1))
                 part_queue.task_done()
                 if wait_sec > 0:
@@ -498,7 +486,7 @@ async def save_cache_record(
         print(f"DB Cache Save Error: {e}")
 
 # ==========================================
-# SINGLE TASK EXECUTOR (INSIDE STANDBY DAEMON)
+# SINGLE TASK EXECUTOR (WITH CHECKPOINTING)
 # ==========================================
 async def execute_task(
     task: dict,
@@ -507,13 +495,18 @@ async def execute_task(
     helper_pool: dict,
     sender_pool: PersistentSenderPool,
     users_col,
-    cache_col
+    cache_col,
+    queue_col
 ):
+    task_id = task["_id"]
     user_id = int(task["user_id"])
     chat_id = int(task["chat_id"])
     status_msg_id = int(task["status_msg_id"])
     peer_str = str(task["peer_id"])
     msg_ids = [int(x) for x in task["msg_ids"]]
+    total_posts = int(task.get("total_count") or len(msg_ids))
+    already_done_offset = max(0, total_posts - len(msg_ids))
+
     max_mb = int(task.get("max_mb", 500))
     workers = int(task.get("workers", 16))
     max_speed_mb = int(task.get("max_speed_mb", 0))
@@ -532,7 +525,6 @@ async def execute_task(
         await bot_client.edit_message(chat_id, status_msg_id, "❌ **Session မရှိတော့ပါ။** `/start` နှိပ်ပြီး ပြန်လည် Login ဝင်ပါ။")
         return
 
-    # Pre-warmed Helper Bot ကို ရွေးချယ်ခြင်း (Login ပြန်ဝင်ရန် မလိုပါ)
     upload_client = bot_client
     upload_bot_key = 0
     use_helper_bridge = False
@@ -560,13 +552,13 @@ async def execute_task(
     completed_bytes = 0
 
     try:
-        total_posts = len(msg_ids)
-        for idx, msg_id in enumerate(msg_ids, start=1):
+        for idx, msg_id in enumerate(msg_ids, start=already_done_offset + 1):
             step_counter = f"{idx}/{total_posts}"
             msg = await user_client.get_messages(peer, ids=msg_id)
 
             if not msg:
                 await bot_client.send_message(chat_id, f"⚠️ `({step_counter})` ပို့စ်နံပါတ် `{msg_id}` ကို ရှာမတွေ့ပါ။")
+                await queue_col.update_one({"_id": task_id}, {"$pull": {"msg_ids": msg_id}, "$set": {"updated_at": time.time()}})
                 continue
 
             # ၁။ စာသားသက်သက်
@@ -580,6 +572,7 @@ async def execute_task(
                             user_id, source_link, peer_str, msg_id, "text", 0, "text/plain"
                         )
                     completed_files += 1
+                await queue_col.update_one({"_id": task_id}, {"$pull": {"msg_ids": msg_id}, "$set": {"updated_at": time.time()}})
                 continue
 
             f_size = getattr(msg.file, "size", 0) or 0
@@ -588,6 +581,7 @@ async def execute_task(
                     chat_id,
                     f"⚠️ `({step_counter})` ပို့စ် `{msg_id}` ၏ ဖိုင်ဆိုဒ် (`{f_size / (1024 * 1024):.1f} MB`) သည် သင်၏ Limit (`{max_mb} MB`) ထက် ကျော်လွန်နေပါသည်။"
                 )
+                await queue_col.update_one({"_id": task_id}, {"$pull": {"msg_ids": msg_id}, "$set": {"updated_at": time.time()}})
                 continue
 
             # ၂။ ပုံအသေး သို့မဟုတ် 2MB အောက် ဖိုင်အသေးများ
@@ -619,6 +613,7 @@ async def execute_task(
                     )
                 completed_files += 1
                 completed_bytes += f_size
+                await queue_col.update_one({"_id": task_id}, {"$pull": {"msg_ids": msg_id}, "$set": {"updated_at": time.time()}})
                 if total_posts > 1:
                     await asyncio.sleep(1.0)
                 continue
@@ -736,6 +731,12 @@ async def execute_task(
             completed_files += 1
             completed_bytes += doc.size
 
+            # ပြီးသွားသော msg_id ကို Queue ထဲမှ ချက်ချင်း ဖယ်ရှားပေးခြင်း (Checkpoint)
+            await queue_col.update_one(
+                {"_id": task_id},
+                {"$pull": {"msg_ids": msg_id}, "$set": {"updated_at": time.time()}}
+            )
+
             if total_posts > 1:
                 await asyncio.sleep(1.0)
 
@@ -788,7 +789,6 @@ async def run_standby_daemon():
     queue_col = db["task_queue"]
     nodes_col = db["worker_nodes"]
 
-    # Helper Bot အားလုံးကို ကြိုတင် Login ဝင်ပြီး အသင့်ချိတ်ဆက်ထားခြင်း (Pre-Warmed Pool)
     helper_pool = {}
 
     async def sync_helper_bots():
@@ -816,11 +816,13 @@ async def run_standby_daemon():
 
     sender_pool = PersistentSenderPool()
     current_status = ["idle"]
+    active_task_id = [None]
     tasks_done = [0]
     stop_signal = [False]
 
     async def heartbeat_reporter():
         while not stop_signal[0]:
+            now_hb = time.time()
             try:
                 await nodes_col.update_one(
                     {"worker_id": WORKER_ID},
@@ -830,10 +832,16 @@ async def run_standby_daemon():
                         "status": current_status[0],
                         "tasks_completed": tasks_done[0],
                         "started_at": boot_ts,
-                        "last_heartbeat": time.time()
+                        "last_heartbeat": now_hb
                     }},
                     upsert=True
                 )
+                # လက်ရှိ ဆွဲနေသော Task ကိုလည်း အသက်ရှင်နေကြောင်း 20s တစ်ကြိမ် Update လုပ်ပေးမည်
+                if active_task_id[0] is not None:
+                    await queue_col.update_one(
+                        {"_id": active_task_id[0]},
+                        {"$set": {"updated_at": now_hb}}
+                    )
             except Exception:
                 pass
             await asyncio.sleep(20)
@@ -842,19 +850,28 @@ async def run_standby_daemon():
     last_helper_sync = time.time()
 
     try:
-        # 5.3 နာရီတိုင်အောင် MongoDB Queue ကို 0.3s တစ်ကြိမ် အသင့်စောင့်ကြည့်နေမည်
         while time.time() - boot_ts < MAX_DAEMON_LIFETIME:
             if time.time() - last_helper_sync > 120:
                 await sync_helper_bots()
                 last_helper_sync = time.time()
 
-            # VIP Priority (1) ကို အရင်ဆုံး ဆွဲထုတ်မည်
+            # Per-User Session Lock: အခြား Worker တစ်ခုက လက်ရှိဆွဲပေးနေသော User ၏ အကောင့်ကို
+            # ပြိုင်တူ ဝင်မဆွဲမိစေရန် busy_users စစ်ဆေးခြင်း
+            busy_users = []
+            async for b_doc in queue_col.find({"status": "processing"}, {"user_id": 1}):
+                busy_users.append(b_doc["user_id"])
+
+            now_claim = time.time()
             task = await queue_col.find_one_and_update(
-                {"status": "pending"},
+                {
+                    "status": "pending",
+                    "user_id": {"$nin": busy_users}
+                },
                 {"$set": {
                     "status": "processing",
                     "worker_id": WORKER_ID,
-                    "started_at": time.time()
+                    "started_at": now_claim,
+                    "updated_at": now_claim
                 }},
                 sort=[("priority", 1), ("created_at", 1)]
             )
@@ -864,6 +881,7 @@ async def run_standby_daemon():
                 continue
 
             current_status[0] = "busy"
+            active_task_id[0] = task["_id"]
             await nodes_col.update_one(
                 {"worker_id": WORKER_ID},
                 {"$set": {"status": "busy", "last_heartbeat": time.time()}}
@@ -877,7 +895,8 @@ async def run_standby_daemon():
                     helper_pool=helper_pool,
                     sender_pool=sender_pool,
                     users_col=users_col,
-                    cache_col=cache_col
+                    cache_col=cache_col,
+                    queue_col=queue_col
                 )
                 await queue_col.delete_one({"_id": task["_id"]})
                 tasks_done[0] += 1
@@ -888,6 +907,7 @@ async def run_standby_daemon():
                     {"$set": {"status": "failed", "error": str(e)}}
                 )
             finally:
+                active_task_id[0] = None
                 current_status[0] = "idle"
                 await nodes_col.update_one(
                     {"worker_id": WORKER_ID},
